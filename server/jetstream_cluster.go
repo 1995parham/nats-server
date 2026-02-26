@@ -3179,6 +3179,36 @@ func (mset *stream) waitOnConsumerAssignments() {
 	}
 }
 
+func prepareStreamRecovery(mset *stream, n RaftNode) error {
+	if n == nil || mset == nil || !mset.shouldReplayFromWAL() {
+		return nil
+	}
+
+	index, _, _ := n.Progress()
+	if index == 0 {
+		return nil
+	}
+
+	snapIndex, snapData, err := n.LoadLastSnapshot()
+	if err != nil && err != errNoSnapAvailable {
+		return err
+	}
+
+	// In case of clean shutdown, no need to replay from WAL
+	if snapIndex == index {
+		return nil
+	}
+
+	var snap *StreamReplicatedState
+	if err == nil {
+		snap, err = decodeStreamSnapshot(snapData)
+		if err != nil {
+			return err
+		}
+	}
+	return mset.prepareForWALReplay(snap)
+}
+
 // Monitor our stream node for this stream.
 func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnapshot bool) {
 	s, cc := js.server(), js.cluster
@@ -3256,6 +3286,10 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 	// Don't allow the upper layer to install snapshots until we have
 	// fully recovered from disk.
 	isRecovering := true
+	if err := prepareStreamRecovery(mset, n); err != nil {
+		s.Warnf("Error preparing WAL replay recovery for stream '%s > %s': %v", accName, sa.Config.Name, err)
+		return
+	}
 
 	var (
 		snapMu           sync.Mutex
@@ -4366,9 +4400,6 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 				return 0, fmt.Errorf("unknown stream entry op type: %v", op)
 			}
 		} else if e.Type == EntrySnapshot {
-			// Everything operates on new replicated state. Will convert legacy snapshots to this for processing.
-			var ss *StreamReplicatedState
-
 			onBadState := func(err error) {
 				// If we are the leader or recovering, meaning we own the snapshot,
 				// we should stepdown and clear our raft state since our snapshot is bad.
@@ -4381,31 +4412,10 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 				}
 			}
 
-			// Check if we are the new binary encoding.
-			if IsEncodedStreamState(e.Data) {
-				var err error
-				ss, err = DecodeStreamState(e.Data)
-				if err != nil {
-					onBadState(err)
-					return 0, err
-				}
-			} else {
-				var snap streamSnapshot
-				if err := json.Unmarshal(e.Data, &snap); err != nil {
-					onBadState(err)
-					return 0, err
-				}
-				// Convert over to StreamReplicatedState
-				ss = &StreamReplicatedState{
-					Msgs:     snap.Msgs,
-					Bytes:    snap.Bytes,
-					FirstSeq: snap.FirstSeq,
-					LastSeq:  snap.LastSeq,
-					Failed:   snap.Failed,
-				}
-				if len(snap.Deleted) > 0 {
-					ss.Deleted = append(ss.Deleted, DeleteSlice(snap.Deleted))
-				}
+			ss, err := decodeStreamSnapshot(e.Data)
+			if err != nil {
+				onBadState(err)
+				return 0, err
 			}
 
 			if err := mset.processSnapshot(ss, ce.Index); err != nil {
@@ -5300,10 +5310,21 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 			if !started {
 				mset.monitorWg.Done()
 			}
+			mset.setStreamAssignment(sa)
+			err = mset.updateWithAdvisory(cfg, !recovering, false)
 		} else if numReplicas == 1 && alreadyRunning {
 			// We downgraded to R1. Make sure we cleanup the raft node and the stream monitor.
-			mset.removeNode()
 			mset.stopMonitoring()
+
+			// Before removing the node, make sure the store is durable and configured
+			// for R1 before incoming message are treated as unreplicated.
+			if err := mset.flushAllPending(); err != nil {
+				s.Errorf("Failed to flush stream '%s > %s' before scale down: %v",
+					mset.accName(), mset.name(), err)
+			}
+			err = mset.updateWithAdvisory(cfg, !recovering, false)
+
+			mset.removeNode()
 			// In case we need to shutdown the cluster specific subs, etc.
 			mset.mu.Lock()
 			// Stop responding to sync requests.
@@ -5315,12 +5336,11 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 			js.mu.Lock()
 			rg.node = nil
 			js.mu.Unlock()
+			mset.setStreamAssignment(sa)
+		} else {
+			mset.setStreamAssignment(sa)
+			err = mset.updateWithAdvisory(cfg, !recovering, false)
 		}
-		// Set the new stream assignment.
-		mset.setStreamAssignment(sa)
-
-		// Call update.
-		err = mset.updateWithAdvisory(cfg, !recovering, false)
 	}
 
 	// If not found we must be expanding into this node since if we are here we know we are a member.
@@ -10228,6 +10248,28 @@ type streamSnapshot struct {
 	Deleted  []uint64 `json:"deleted,omitempty"`
 }
 
+func decodeStreamSnapshot(data []byte) (*StreamReplicatedState, error) {
+	if IsEncodedStreamState(data) {
+		return DecodeStreamState(data)
+	}
+
+	var snap streamSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return nil, err
+	}
+	state := &StreamReplicatedState{
+		Msgs:     snap.Msgs,
+		Bytes:    snap.Bytes,
+		FirstSeq: snap.FirstSeq,
+		LastSeq:  snap.LastSeq,
+		Failed:   snap.Failed,
+	}
+	if len(snap.Deleted) > 0 {
+		state.Deleted = append(state.Deleted, DeleteSlice(snap.Deleted))
+	}
+	return state, nil
+}
+
 // Grab a snapshot of a stream for clustered mode.
 func (mset *stream) stateSnapshot() []byte {
 	mset.mu.RLock()
@@ -10629,9 +10671,9 @@ func (mset *stream) processSnapshot(snap *StreamReplicatedState, index uint64) (
 		return errCatchupCorruptSnapshot
 	}
 
-	// Just return if up to date.
+	// No catchup is needed, flush any snapshot deletes before returning.
 	if sreq == nil {
-		return nil
+		return mset.flushAllPending()
 	}
 
 	// We need to catch up, but are already exceeding limits.
