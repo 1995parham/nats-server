@@ -6176,6 +6176,12 @@ func setBaselineOptions(opts *Options) {
 	if opts.JetStreamConcurrentIOs <= 0 {
 		opts.JetStreamConcurrentIOs = defaultConcurrentIOs
 	}
+	if opts.JetStreamLimits.MaxStreamsTotal == 0 {
+		opts.JetStreamLimits.MaxStreamsTotal = JSDefaultMaxStreamsTotal
+	}
+	if opts.JetStreamLimits.MaxConsumersTotal == 0 {
+		opts.JetStreamLimits.MaxConsumersTotal = JSDefaultMaxConsumersTotal
+	}
 }
 
 func getDefaultAuthTimeout(tls *tls.Config, tlsTimeout float64) float64 {
